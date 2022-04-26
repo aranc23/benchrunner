@@ -38,7 +38,7 @@ our $OFFSET;
 # default log file
 our $LOG=$HOME.'/benchrunner.log';
 # run blkdiscard on each @DEVICE before starting
-my $TRIM=0;
+my $BLKDISCARD=0;
 # run the destroy code for a fs or not
 my $DESTROY=1;
 # if set, don't run anything
@@ -108,7 +108,7 @@ GetOptions( 'device=s'     => \@DEVICE,
             'source=s'     => \$SOURCE,
             'fsblock=i@'   => $FSOPTIONS{fsblock},
             'recordsize=s@'=> $FSOPTIONS{recordsize},
-            'trim!'        => \$TRIM,
+            'blkdiscard!'  => \$BLKDISCARD,
             'flush=s@'     => $OPTIONS{flush},
             'destroy!'     => \$DESTROY,
             'prefetch=s@'  => $OPTIONS{prefetch},
@@ -201,6 +201,7 @@ our %matrix=( 'reiserfs' => {
                            my %fsopts=%{$_[0]};
                            sissy('mkfs.xfs','-f',
                                  (defined $fsopts{fsblock} ? ('-b','size='.$fsopts{fsblock}) : ()),
+                                 (defined $TRIM ? ('-o', 'discard') : ()),
                                  (defined $XFS_SU ? ('-d','su='.$XFS_SU) : ()),
                                  (defined $XFS_SW ? ('-d','sw='.$XFS_SW) : ()),
                                  $DEVICE[0]);
@@ -661,7 +662,7 @@ foreach my $fsopts (multiplex(\%FSOPTIONS)) {
       };
     }
   }
-  if($TRIM) {
+  if($BLKDISCARD) {
     foreach my $d (@DEVICE,@CACHE) {
       eval {
         sissy('blkdiscard',$d);
@@ -896,7 +897,7 @@ sub runsummary {
   push(@a,"numruns=$NUMRUNS");
   push(@a,'fs='.$$fsopts{fs});
   push(@a,"bench=$BENCH");
-  push(@a,"trim=".($TRIM ? 'true' : 'false'));
+  push(@a,"discard=".($BLKDISCARD ? 'true' : 'false'));
   if($$fsopts{fs} =~ /^zfs/) {
     push(@a,"recordsize=".to_k(to_bytes($$fsopts{recordsize})).'k');
     push(@a,"prefetch=".$$opts{prefetch});
