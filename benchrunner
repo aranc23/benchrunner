@@ -39,6 +39,8 @@ our $OFFSET;
 our $LOG=$HOME.'/benchrunner.log';
 # run blkdiscard on each @DEVICE before starting
 my $BLKDISCARD=0;
+# mount (most) filesystems with -o discard
+my $DISCARD=0;
 # run the destroy code for a fs or not
 my $DESTROY=1;
 # if set, don't run anything
@@ -109,6 +111,7 @@ GetOptions( 'device=s'     => \@DEVICE,
             'fsblock=i@'   => $FSOPTIONS{fsblock},
             'recordsize=s@'=> $FSOPTIONS{recordsize},
             'blkdiscard!'  => \$BLKDISCARD,
+            'discard!'     => \$DISCARD,
             'flush=s@'     => $OPTIONS{flush},
             'destroy!'     => \$DESTROY,
             'prefetch=s@'  => $OPTIONS{prefetch},
@@ -836,7 +839,8 @@ sub b_mount {
   if(exists $matrix{$fs}{mount}) {
     &{$matrix{$fs}{mount}};
   } else {
-    sissy('mount','-o',$$fsopts{options},$DEVICE[0],$MOUNT);
+    my $opt_string=$DISCARD ? $fsopts{options}.',discard' : $fsopts{options};
+    sissy('mount','-o',$opt_string,$DEVICE[0],$MOUNT);
   }
 }
 
