@@ -201,7 +201,6 @@ our %matrix=( 'reiserfs' => {
                            my %fsopts=%{$_[0]};
                            sissy('mkfs.xfs','-f',
                                  (defined $fsopts{fsblock} ? ('-b','size='.$fsopts{fsblock}) : ()),
-                                 (defined $TRIM ? ('-o', 'discard') : ()),
                                  (defined $XFS_SU ? ('-d','su='.$XFS_SU) : ()),
                                  (defined $XFS_SW ? ('-d','sw='.$XFS_SW) : ()),
                                  $DEVICE[0]);
