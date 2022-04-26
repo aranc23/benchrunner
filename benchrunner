@@ -839,7 +839,7 @@ sub b_mount {
   if(exists $matrix{$fs}{mount}) {
     &{$matrix{$fs}{mount}};
   } else {
-    my $opt_string=$DISCARD ? $fsopts{options}.',discard' : $fsopts{options};
+    my $opt_string=$DISCARD ? $$fsopts{options}.',discard' : $$fsopts{options};
     sissy('mount','-o',$opt_string,$DEVICE[0],$MOUNT);
   }
 }
