@@ -896,7 +896,7 @@ sub runsummary {
   push(@a,"numruns=$NUMRUNS");
   push(@a,'fs='.$$fsopts{fs});
   push(@a,"bench=$BENCH");
-  push(@a,"discard=".($BLKDISCARD ? 'true' : 'false'));
+  push(@a,"blkdiscard=".($BLKDISCARD ? 'true' : 'false'));
   if($$fsopts{fs} =~ /^zfs/) {
     push(@a,"recordsize=".to_k(to_bytes($$fsopts{recordsize})).'k');
     push(@a,"prefetch=".$$opts{prefetch});
