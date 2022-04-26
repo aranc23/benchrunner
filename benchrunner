@@ -1,0 +1,1212 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+use local::lib;
+use Getopt::Long;
+use File::Tee qw(tee);
+use Env qw( HOME );
+use Time::HiRes qw( time );
+use POSIX qw( strftime :sys_wait_h ceil);
+use Unix::Getrusage;
+use Data::Dumper;
+
+# save the uname output for use later
+my $UNAME=`uname`;chomp $UNAME;
+# preserve the options the program was invoked with for use later
+my $INVOKE=join(' ',map { "'".$_."'" } ($0,@ARGV));
+# top level pid for logging in benchrunner
+my $PID=$$;
+
+# list of devices to create filesystems on
+our @DEVICE;
+our @real_devices;
+# additonal devices to collect block stats on
+my @BLOCKSTATS;
+# devices to add as a zfs cache (l2arc) device after the prep phase
+my @CACHE;
+# mount point
+our $MOUNT='/mnt/bench';
+# number of times to run the benchmark program
+our $NUMRUNS=3;
+# used as a regular expression to match which filesystems to test
+my $MATCH;
+# benchmark to run
+our $BENCH='bonnie++';
+# used to create a partition which is $OFFSET blocks? bytes
+our $OFFSET;
+# default log file
+our $LOG=$HOME.'/benchrunner.log';
+# run blkdiscard on each @DEVICE before starting
+my $TRIM=0;
+# run the destroy code for a fs or not
+my $DESTROY=1;
+# if set, don't run anything
+my $TEST=0;
+# run wipefs -a on each block device
+my $WIPEFS=(system('which wipefs >/dev/null 2>/dev/null') == 0 ? 1 : 0);
+
+# fio specific
+# only used for fio media scanner-like random read tests
+# my $FIOSIZE=(32*1024);
+# my $FIOFILES;
+# set default path to fio
+my $FIOPATH=`which fio 2>/dev/null`;chomp $FIOPATH;
+# amarok specific
+# source to rsync from when setting up amarok test
+my $SOURCE='/myth/music-test/';
+# bonnie++ specific
+# user to use when invoking bonnie++
+our $USER='spin';
+# xfs filesystem creation options
+our $XFS_SU;
+our $XFS_SW;
+# set zfs arc max if set
+my $ZFS_ARC_MAX;
+# fio version
+our $FIO_VERSION=`fio --version`;
+our $FIO_FADVISE_OPTION=( $FIO_VERSION =~ /^fio\-2\.1$/ ? 'fadvise' : 'fadvise_hint' );
+
+# raid builder md device
+our $RAID_LEVEL = undef;
+our $MD_DEVICE='/dev/md/99';
+our $CHUNK='512K';
+our $Z_SIZE;
+
+my %FSOPTIONS=(
+               fs         => [],
+               fsblock    => [],
+               recordsize => [],
+               options    => [],
+              );
+my %OPTIONS=(
+             size     => [],
+             block    => [],
+             threads  => [],
+             prefetch => [],
+             flush    => [],
+             fadvise  => [],
+             ioengine => [],
+             iodepth  => [],
+             runtime  => [],
+            );
+
+GetOptions( 'device=s'     => \@DEVICE,
+            'blockstats=s' => \@BLOCKSTATS,
+            'cache=s'      => \@CACHE,
+            'mount=s'      => \$MOUNT,
+            'size=s@'      => $OPTIONS{size},
+            'threads=i@'   => $OPTIONS{threads},
+            'numruns=i'    => \$NUMRUNS,
+            'match=s'      => \$MATCH,
+            'bench=s'      => \$BENCH,
+            'user=s'       => \$USER,
+            'offset=i'     => \$OFFSET,
+            'block=s@'     => $OPTIONS{block},
+            'log=s'        => \$LOG,
+            'options=s@'   => $FSOPTIONS{options},
+            'source=s'     => \$SOURCE,
+            'fsblock=i@'   => $FSOPTIONS{fsblock},
+            'recordsize=s@'=> $FSOPTIONS{recordsize},
+            'trim!'        => \$TRIM,
+            'flush=s@'     => $OPTIONS{flush},
+            'destroy!'     => \$DESTROY,
+            'prefetch=s@'  => $OPTIONS{prefetch},
+            'fs=s@'        => $FSOPTIONS{fs},
+            'test!'        => \$TEST,
+            'wipefs!'      => \$WIPEFS, # wipe filesystems
+            # 'fiosize=i'    => \$FIOSIZE, #in megs
+            # 'fiofiles=i'   => \$FIOFILES, # number of files to create
+            'fiopath=s'    => \$FIOPATH, # path to fio binary
+            'fadvise=s@'   => $OPTIONS{fadvise},
+            'ioengine=s@'  => $OPTIONS{ioengine},
+            'iodepth=s@'   => $OPTIONS{iodepth},
+            'runtime=s@'   => $OPTIONS{runtime},
+            'su=s'         => \$XFS_SU,
+            'sw=s'         => \$XFS_SW,
+            'zfs_arc_max=s'=> \$ZFS_ARC_MAX,
+            'raid=s'       => \$RAID_LEVEL,
+            'md=s',        => \$MD_DEVICE,
+            'chunk=s'      => \$CHUNK,
+            'zsize=s'      => \$Z_SIZE,
+          );
+
+# if $FIOFILES still isn't set after collecting options do so now:
+#$FIOFILES=int($FIOSIZE/10) unless defined $FIOFILES;
+
+# must be set, but could probably be determined as tiobench does
+defopt('size',to_m(mem_total_bytes()*2)."m");
+# prefetch can be enabled disabled on a per-benchmark basis, even if it is a 
+defopt('prefetch','true');
+#defopt('fadvise','0');
+defopt('flush','no');
+if($BENCH =~ /^fio-8k/) {
+  defopt('block','8k');
+}
+elsif($BENCH eq 'fio-max-bandwidth') {
+  defopt('block','1m');
+}
+else {
+  defopt('block','4k');
+}
+if($BENCH =~ /^fio-[48]k/) {
+  defopt('threads','16');
+}
+else {
+  defopt('threads','1');
+}
+#defopt('ioengine','libaio');
+#defopt('iodepth','16');
+defopt('runtime','60');
+
+deffsopt('options',($UNAME =~ /FreeBSD/ ? 'noatime' : 'noatime,nodiratime' ));
+deffsopt('recordsize','128k');
+
+unless($TEST) {
+  tee(STDOUT, '>>', $LOG);
+  open(STDERR,">&STDOUT");
+}
+
+if( not -d $MOUNT ) {
+  mkdir $MOUNT or die "mountpoint $MOUNT does not exist and we cannot create it!";
+}
+
+our %matrix=( 'reiserfs' => {
+                             create => sub {
+                               sissy('mkfs','-t','reiserfs','-f','-f',$DEVICE[0]);
+                             }
+                            },
+              'jfs' => {
+                        create => sub {
+                          sissy('mkfs.jfs','-q',$DEVICE[0]);
+                        }
+                       },
+              'ext4' => { },
+              'ext4-noj' => {
+                             create => sub {
+                               my %fsopts=%{$_[0]};
+                               sissy('mke2fs','-F','-t','ext4',
+                                     (defined $fsopts{fsblock} ? ('-b',$fsopts{fsblock}) : ()),
+                                     '-m0',$DEVICE[0]);
+                               sissy('tune2fs','-O','^has_journal',$DEVICE[0]);
+                             },
+                             mount => sub {
+                               my %fsopts=%{$_[0]};
+                               sissy('mount','-o',$fsopts{options}.',discard',$DEVICE[0],$MOUNT);
+                             },
+                            },
+              'ext3' => { },
+              'xfs'  => {
+                         create => sub {
+                           my %fsopts=%{$_[0]};
+                           sissy('mkfs.xfs','-f',
+                                 (defined $fsopts{fsblock} ? ('-b','size='.$fsopts{fsblock}) : ()),
+                                 (defined $XFS_SU ? ('-d','su='.$XFS_SU) : ()),
+                                 (defined $XFS_SW ? ('-d','sw='.$XFS_SW) : ()),
+                                 $DEVICE[0]);
+                         },
+                        },
+              'ext2' => { },
+              'ntfs' => {
+                         create => sub {
+                           sissy('mkfs','-t','ntfs','-f',$DEVICE[0]);
+                         }
+                        },
+              'btrfs' =>
+              {
+               create => sub
+               {
+                 sissy('mkfs.btrfs','-f',@DEVICE);
+               },
+               status => sub
+               {
+                 sissy(qw(btrfs fi show),$DEVICE[0]);
+                 sissy(qw(btrfs fi df),$MOUNT);
+               },
+              },
+              'btrfs-r1' =>
+              {
+               create => sub
+               {
+                 sissy('mkfs.btrfs','-f','-d','raid1',@DEVICE);
+               },
+               status => sub
+               {
+                 sissy(qw(btrfs fi show),$DEVICE[0]);
+                 sissy(qw(btrfs fi df),$MOUNT);
+               },
+              },
+              'zfs' =>
+              {
+               create => sub {
+                 my %fsopts=%{$_[0]};
+                 sissy('zpool','create','-f','benchrunner',@DEVICE);
+                 sissy('zpool','status','benchrunner');
+                 sissy('zpool','get','all','benchrunner');
+                 sissy('zfs','create','-o',"mountpoint=$MOUNT",'-o','atime=off',
+                       '-o','recordsize='.to_k(to_bytes($fsopts{recordsize})).'k',
+                       'benchrunner/btest');
+                 sissy('zfs','get','all','benchrunner/btest');
+                 sissy('zfs','umount','benchrunner/btest');
+                 $UNAME =~ /FreeBSD/ and sissy("sysctl vfs.zfs");
+                 arcstats();
+               },
+               addcache => sub
+               {
+                 foreach my $c (@CACHE) {
+                   sissy('zpool','add','-f','benchrunner','cache',$c);
+                 }
+               },
+               remcache => sub
+               {
+                 foreach my $c (@CACHE) {
+                   sissy('zpool','remove','benchrunner',$c);
+                 }
+               },
+               mount => sub
+               {
+                 sissy('zfs','mount','benchrunner/btest');
+               },
+               umount => sub
+               {
+                 sissy('zfs','umount','benchrunner/btest');
+               },
+               destroy => sub
+               {
+                 sissy('zfs','destroy','benchrunner/btest');
+                 sissy('zpool','destroy','benchrunner');
+               },
+               status  => sub
+               {
+                 sissy('zpool','iostat','-v','benchrunner');
+				 sissy('zpool','status','benchrunner');
+                 arcstats();
+               },
+              },
+              # pretend to do everything, do nothing
+              'raw' =>
+              {
+               create => sub {
+                 logprint("not preparing raw filesystem on ".join(':',@DEVICE));
+               },
+               mount => sub
+               {
+                 logprint("not mounting raw filesystem on ".join(':',@DEVICE));
+               },
+               umount => sub
+               {
+                 logprint("not umounting raw filesystem on ".join(':',@DEVICE));
+               },
+              },
+              'bind' =>
+              {
+               create => sub {
+                 if(@DEVICE > 1) {
+                   die "bind mount only works on a single directory, you specified more than 1";
+                 }
+                 logprint("not preparing bind mount on ".$DEVICE[0]);
+               },
+               mount => sub {
+                 sissy('mount','-o','bind',$DEVICE[0],$MOUNT);
+               },
+              },
+              'exfat' =>
+              {
+               create => sub
+               {
+                 sissy('mkexfatfs',$DEVICE[0]);
+               },
+              },
+              'ffs' =>
+              {
+               create => sub
+               {
+                 sissy('newfs',$DEVICE[0]);
+               },
+              },
+            );
+
+my %benchmarks=( 'amarok' =>
+                 {
+                  prep => sub
+                  {
+                    io_sissy('rsync','-a','--delete',$SOURCE,$MOUNT);
+                  },
+                  run => sub
+                  {
+                    io_sissy(join(' ',
+                             'amarokcollectionscanner',
+                             '-r',
+                             $MOUNT,
+                             '>/dev/null','2>/dev/null'));
+                  },
+                 },
+                 # 'fio-prr' =>
+                 # {
+                 #  prep => sub
+                 #  {
+                 #    io_sissy('fio',
+                 #             '--minimal',
+                 #             '--directory='.$MOUNT,
+                 #             '--thread',
+                 #             '--size='.$FIOSIZE.'m',
+                 #             '--nrfiles='.$FIOFILES,
+                 #             '--name=read',
+                 #             '--rw=read',
+                 #             '--runtime=10',
+                 #            );
+                 #  },
+                 #  run => sub
+                 #  {
+                 #    my ($opts,$run)=@_;
+                 #    io_sissy('fio',
+                 #             '--minimal',
+                 #             '--opendir='.$MOUNT,
+                 #             '--randrepeat=1',
+                 #             '--thread',
+                 #             '--rw=randread',
+                 #             '--size='.to_m(to_bytes($$opts{size})).'m',
+                 #             '--blocksize='.to_bytes($$opts{block}),
+                 #             '--ioengine='.$$opts{ioengine},
+                 #             "--${FIO_FADVISE_OPTION}=".$$opts{fadvise},
+                 #             '--name=run'.$run,
+                 #            );
+                 #  },
+                 # },
+                 # 'fio' =>
+                 # {
+                 #  prep => sub
+                 #  {
+                 #    io_sissy('fio',
+                 #             '--minimal',
+                 #             '--directory='.$MOUNT,
+                 #             '--thread',
+                 #             '--size='.$FIOSIZE.'m',
+                 #             '--nrfiles='.ceil($FIOSIZE/2048),
+                 #             '--name=read',
+                 #             '--rw=read',
+                 #             '--runtime=10',
+                 #            );
+                 #  },
+                 #  run => sub
+                 #  {
+                 #    my ($opts,$run)=@_;
+                 #    io_sissy('fio',
+                 #             '--minimal',
+                 #             '--opendir='.$MOUNT,
+                 #             '--numjobs='.$$opts{threads},
+                 #             '--blocksize='.to_bytes($$opts{block}),
+                 #             '--ioengine='.$$opts{ioengine},
+                 #             "--${FIO_FADVISE_OPTION}=".$$opts{fadvise},
+                 #             '--runtime='.$$opts{runtime},
+                 #             '--name=write-run'.$run,
+                 #             '--stonewall',
+                 #             '--rw=write',
+                 #             '--name=randwrite-run'.$run,
+                 #             '--stonewall',
+                 #             '--rw=randwrite',
+                 #             '--name=read-run'.$run,
+                 #             '--stonewall',
+                 #             '--rw=read',
+                 #             '--name=randread-run'.$run,
+                 #             '--stonewall',
+                 #             '--rw=randread',
+                 #            );
+                 #  },
+                 # },
+                 'fio-tiobench' =>
+                 {
+                  run => sub
+                  {
+                    my ($opts,$run)=@_;
+                    # make one file per thread, use threads
+                    io_sissy('fio',
+                             '--output-format=json',
+                             '--group_reporting',
+                             '--numjobs='.$$opts{threads},
+                             ($$opts{fsopts}{fs} eq 'raw' ?
+                              '--filename='.join(':',@DEVICE)
+                              :
+                              '--directory='.$MOUNT,
+                              '--filename_format=fio-$jobnum',
+                             ),
+                             '--size='.to_m(to_bytes($$opts{size})/$$opts{threads}).'m',
+                             '--blocksize='.to_bytes($$opts{block}),
+                             #'--thread', # use pthreads not fork
+                             '--overwrite=1',
+                             '--buffered=1', #explicitly use buffered, because tiobench does
+                             optornot($opts,'ioengine','ioengine'),
+                             optornot($opts,'iodepth','iodepth'),
+                             optornot($opts,$FIO_FADVISE_OPTION,'fadvise'),
+                             "--name=seqwrite", "--rw=write", "--end_fsync=1",
+                             "--name=randwrite", "--stonewall", "--runtime=$$opts{runtime}", "--rw=randwrite",  "--end_fsync=1",
+                             "--name=seqread", "--stonewall", "--rw=read",
+                             "--name=randread", "--stonewall", "--runtime=$$opts{runtime}", "--rw=randread",
+                            );
+                  },
+                 },
+                 'fio-real-life' =>
+                 {
+                  run => sub
+                  {
+                    my ($opts,$run)=@_;
+                    io_sissy('fio',
+                             '--output-format=json',
+                             '--group_reporting',
+                             '--directory='.$MOUNT,
+                             '--numjobs='.$$opts{threads},
+                             '--size='.to_m(to_bytes($$opts{size})).'m',
+                             '--blocksize='.to_bytes($$opts{block}),
+                             optornot($opts,'ioengine','ioengine'),
+                             optornot($opts,'iodepth','iodepth'),
+                             optornot($opts,$FIO_FADVISE_OPTION,'fadvise'),
+                             '--direct=1',
+                             '--thread',
+                             '--unified_rw_reporting=1',
+                             '--randrepeat=1',
+                             '--norandommap=1',
+#                             '--nrfiles='.$FIOFILES,
+                             '--file_service_type=random',
+                             '--filename=fio1:fio2:fio3:fio4:fio5:fio6:fio7:fio8',
+                             '--name=randrw',
+                             '--rw=randrw',
+                             "--runtime=$$opts{runtime}",
+                             '--rwmixread=80',
+                             '--rwmixwrite=20',
+                             '--unlink=1',
+                            );
+                  },
+                 },
+                 'fio-max-bandwidth' =>
+                 {
+                  run => sub
+                  {
+                    my ($opts,$run)=@_;
+                    io_sissy('fio',
+                             '--output-format=json',
+                             '--group_reporting',
+                             '--numjobs='.$$opts{threads},
+                             '--blocksize='.to_bytes($$opts{block}),
+                             optornot($opts,'ioengine','ioengine'),
+                             optornot($opts,'iodepth','iodepth'),
+                             optornot($opts,$FIO_FADVISE_OPTION,'fadvise'),
+                             ($$opts{fsopts}{fs} eq 'raw' ?
+                              '--filename='.join(':',@DEVICE)
+                              :
+                              '--directory='.$MOUNT,
+                              '--filename_format=fio-$jobnum',
+                             ),
+                             '--size='.to_m(to_bytes($$opts{size})/$$opts{threads}).'m',
+                             '--direct='.($$opts{fsopts}{fs} =~ /zfs|bind/ ? 0 : '1'),
+                             '--name=write-run'.$run,
+                             '--stonewall',
+                             '--rw=write',
+                             '--name=read-run'.$run,
+                             '--stonewall',
+                             '--rw=read',
+                             '--unlink=1',
+#                             '--loops=3',
+                            );
+                  },
+                 },
+                 'fio-4ktest' =>
+                 {
+                  run => sub
+                  {
+                    my ($opts,$run,$summary)=@_;
+                    # use the raw device is fs type is raw, otherwise a single file on the mountpoint
+                    # intended to be run with 4k blocksize, 16 threads/jobs, iodepth of 16
+                    io_sissy($FIOPATH,
+                             ($$opts{fsopts}{fs} eq 'raw' ?
+                              '--filename='.$DEVICE[0] :
+                              ('--directory='.$MOUNT,
+                               '--size='.to_m(to_bytes($$opts{size})).'m',
+                               '--file_service_type=random',
+                               '--filename='.join(':',map { 'fio'.$_ } (1..$$opts{threads})),
+                               #'--unlink=1',
+                               #'--filename=fio',
+                              ),
+                             ),
+                             '--output-format=json',
+                             '--direct='.($$opts{fsopts}{fs} eq 'zfs' ? 0 : '1'),
+                             '--rw=randrw',
+                             '--refill_buffers',
+                             '--norandommap',
+                             '--randrepeat=0',
+                             optornot($opts,'ioengine','ioengine'),
+                             optornot($opts,'iodepth','iodepth'),
+                             optornot($opts,$FIO_FADVISE_OPTION,'fadvise'),
+                             '--runtime='.$$opts{runtime},
+                             '--group_reporting',
+                             '--numjobs='.$$opts{threads},
+                             '--blocksize='.to_bytes($$opts{block}),
+                             "--name=fio-4ktest-read-$run",
+                             '--stonewall',
+                             '--rwmixread=100',
+                             "--name=fio-4ktest-write-$run",
+                             '--stonewall',
+                             '--rwmixread=0',
+                            );
+                  },
+                 },
+                 'fio-7030split' =>
+                 {
+                  run => sub
+                  {
+                    my ($opts,$run,$summary)=@_;
+                    io_sissy($FIOPATH,
+                             '--output-format=json',
+                             '--blocksize='.to_bytes($$opts{block}),
+                             '--group_reporting',
+                             '--unified_rw_reporting=1',
+                             ($$opts{fsopts}{fs} eq 'raw' ?
+                              '--filename='.$DEVICE[0] :
+                              ('--directory='.$MOUNT,
+                               '--size='.to_m(to_bytes($$opts{size})).'m',
+                               '--file_service_type=random',
+                               '--filename='.join(':',map { 'fio'.$_ } (1..$$opts{threads})),
+                               #'--unlink=1',
+                               #'--filename=fio',
+                              ),
+                             ),
+                             '--numjobs='.$$opts{threads},
+                             optornot($opts,'ioengine','ioengine'),
+                             optornot($opts,'iodepth','iodepth'),
+                             optornot($opts,$FIO_FADVISE_OPTION,'fadvise'),
+                             '--direct='.($$opts{fsopts}{fs} eq 'zfs' ? 0 : '1'),
+                             '--name=7030split',
+                             '--rw=randrw',
+                             '--refill_buffers',
+                             '--norandommap',
+                             '--randrepeat=0',
+                             '--rwmixread=70',
+                             '--runtime='.$$opts{runtime},
+                            );
+                  },
+                 },
+                 'bonnie++' =>
+                 {
+                  prep => sub
+                  {
+                    sissy('mkdir',$MOUNT.'/tmp');
+                    sissy('chmod','a+rwxt',$MOUNT.'/tmp');
+                  },
+                  run => sub
+                  {
+                    my ($opts,$run)=@_;
+                    io_sissy('bonnie++','-q','-n','0','-x',1,'-c',$$opts{threads},'-d',$MOUNT.'/tmp','-s',to_m(to_bytes($$opts{size})).':'.to_bytes($$opts{block}),'-u',$USER);
+                  },
+                 },
+               );
+
+if(defined $MATCH and length $MATCH > 0) {
+  push(@{$FSOPTIONS{fs}},grep($MATCH,keys(%matrix)));
+}
+
+unless(@{$FSOPTIONS{fs}} > 0) {
+  die "you must specify filesystems to test with --fs or --match";
+}
+
+unless(exists $benchmarks{$BENCH}) {
+  die "specified benchmark ($BENCH) does not exist";
+}
+
+logprint("invoked: $INVOKE");
+
+foreach my $d (@DEVICE,@BLOCKSTATS,@CACHE) {
+  $d =~ /^\/dev\// or next;
+  my $dc=$d;
+  $dc =~ /\/dev\/sd[a-z]/     and $dc =~ s/\d$//;        # remove single digit at the end
+  $dc =~ /\/dev\/disk\by\-id/ and $dc =~ s/\-part\d+$//; # remove -partX at the end
+  # allow smartctl to fail, it's not critical
+  my @com;
+  if($dc =~ /\/dev\/md/) {
+    @com=('mdadm','--detail',$dc);
+  }
+  elsif($dc =~ /^\/dev\//)
+  {
+    @com=('smartctl','-i',$dc);
+  }
+  eval {
+    sissy(@com);
+  }
+}
+
+sub REAPER { };
+
+# do some RAID building magic, if required
+build_raid() if $RAID_LEVEL;
+
+foreach my $fsopts (multiplex(\%FSOPTIONS)) {
+  my $fs=$$fsopts{fs};
+  $fs =~ /^zfs/ and arcstats();
+  if($fs eq 'btrfs-r1' and @DEVICE == 1) {
+    # don't try btrfs raid1 with only one device, it will fail
+    next;
+  }
+  logprint("starting benchmark run for $fs");
+  if(defined $OFFSET) {
+    my $BASE=$DEVICE[0];
+    unless($DEVICE[0] =~ /\/dev\/sd.+1$/ and $BASE =~ s/1$//) {
+      die "offset can only be specified if the block device is sdX1";
+    }
+    sissy("echo $OFFSET,, | sfdisk -quS $BASE");
+    sleep(5);
+  }
+  if($WIPEFS and $fs !~ /^(bind|raw)/) {
+    foreach my $d (@DEVICE,@CACHE) {
+      next unless $d =~ /^\/dev\//;
+      eval {
+        sissy('wipefs','-a',$d);
+      };
+    }
+  }
+  if($TRIM) {
+    foreach my $d (@DEVICE,@CACHE) {
+      eval {
+        sissy('blkdiscard',$d);
+      };
+    }
+  }
+  if(exists $matrix{$fs}{create}) {
+    &{$matrix{$fs}{create}}($fsopts);
+  } else {
+    sissy('mke2fs','-F','-t',$fs,
+          (defined $$fsopts{fsblock} ? ('-b',$$fsopts{fsblock}) : ()),
+          '-m0',$DEVICE[0]);
+  }
+
+  b_mount($fsopts);
+
+    if(exists $benchmarks{$BENCH}{prep}) {
+      &{$benchmarks{$BENCH}{prep}};
+      b_umount($fsopts);
+      $UNAME =~ /Linux/ and sissy('/sbin/sysctl','-w','vm.drop_caches=3');
+      b_mount($fsopts);
+    }
+    if(defined $ZFS_ARC_MAX and -f '/sys/module/zfs/parameters/zfs_arc_max') {
+      my $t=`cat /sys/module/zfs/parameters/zfs_arc_max`;chomp $t;
+      my $arc_bytes=to_bytes($ZFS_ARC_MAX);
+      $UNAME =~ /Linux/ and sissy("echo ${arc_bytes} >/sys/module/zfs/parameters/zfs_arc_max");
+      $ZFS_ARC_MAX=$t;
+      sissy("cat /sys/module/zfs/parameters/zfs_arc_max");
+    }
+    foreach my $opts (multiplex(\%OPTIONS)) {
+      $$opts{fsopts}=$fsopts;
+      if(exists $matrix{$fs}{addcache}) {
+        &{$matrix{$fs}{addcache}};
+      }
+      if(exists $matrix{$fs}{status}) {
+        &{$matrix{$fs}{status}};
+      }
+      if($fs =~ /zfs/ and defined $$opts{prefetch}) {
+        my $pref;
+        if($$opts{prefetch} =~ /^(false|no|off|0)$/) {
+          $pref='1'; # counter intuitive, but whatever
+        }
+        elsif($$opts{prefetch} =~ /^(true|yes|on|1)$/) {
+          $pref='0';
+        }
+        if($pref eq '0' or $pref eq '1') {
+          $UNAME =~ /FreeBSD/ and sissy("sysctl -w vfs.zfs.prefetch_disable=$pref");
+          $UNAME =~ /Linux/   and sissy("echo $pref >/sys/module/zfs/parameters/zfs_prefetch_disable");
+        }
+        # print the current state of prefetch
+      }
+      prefetch() if $fs =~ /zfs/;
+      foreach(1..$NUMRUNS) {
+        logprint('summary: '.'(run='.$_.','.runsummary($fsopts,$opts).')');
+	$$opts{flush} =~ /^fstrim$/ and sissy('fstrim','-v',$MOUNT);
+        $$opts{flush} =~ /^umount|drop$/ and b_umount($fsopts);
+        $$opts{flush} =~ /^drop$/        and $UNAME =~ /Linux/ and sissy('/sbin/sysctl','-w','vm.drop_caches=3');
+        $$opts{flush} =~ /^umount|drop$/ and b_mount($fsopts);
+        &{$benchmarks{$BENCH}{run}}($opts,$_);
+        if(exists $matrix{$fs}{status}) {
+          &{$matrix{$fs}{status}};
+        }
+      }
+      if(exists $matrix{$fs}{remcache}) {
+        &{$matrix{$fs}{remcache}};
+      }
+    }
+
+  $fs =~ /^zfs/ and arcstats();
+  # it seemed that umount/destroy operations would fail occasionally
+  # so we give the OS time to chill before we kill
+  sleep(10) unless $TEST;
+
+  # umount the filesystem
+  b_umount($fsopts);
+
+  # destroy the filesystem, if needed
+  if(exists $matrix{$fs}{destroy} && $DESTROY) {
+    &{$matrix{$fs}{destroy}};
+  }
+  if(defined $ZFS_ARC_MAX and -f '/sys/module/zfs/parameters/zfs_arc_max') {
+    # resture the original arc max
+    $UNAME =~ /Linux/ and sissy("echo ${ZFS_ARC_MAX} >/sys/module/zfs/parameters/zfs_arc_max");
+  }
+}
+
+destroy_raid() if $RAID_LEVEL;
+
+sub sortsub {
+  my $aprio=(exists $matrix{$a}{priority} ? $matrix{$a}{priority} : 0);
+  my $bprio=(exists $matrix{$b}{priority} ? $matrix{$b}{priority} : 0);
+  if($aprio != $bprio) {
+    return $aprio <=> $bprio;
+  } else {
+    return $a cmp $b;
+  }
+}
+
+sub sissy {
+  delete $SIG{CHLD};
+  logprint(join(" ",@_));
+  $TEST and return;
+  my $start_time=time();
+  system(@_);
+  logprint(sprintf('run time: %.6f seconds',(time()-$start_time)));
+  unless($? == 0) {
+    die "failed: $?";
+  }
+}
+
+sub io_sissy {
+  if($TEST) {
+    logprint(join(" ",@_));
+    return;
+  }
+  my $start_arcstats=getarcstats();
+  my $start_blockstats=getallblockstats();
+  my $start_memstats=getmemstats();
+  my $start_time=time();
+  my $end_time;
+  my $start_ru=getrusage_children;
+
+  $SIG{CHLD}=\&REAPER;
+  my $pid = fork();
+  die "cannot fork" unless defined $pid;
+  if($pid == 0) {
+    delete $SIG{CHLD};
+    logprint(join(" ",'['.$$.']',@_));
+    exec(@_);
+    die "failed to exec";
+  }
+  # must be the parent
+  while(1) { # danger!
+    # the logic is thus:
+    # 1) save the accumulated io stats for our child before we reap
+    # 2) call waitpid
+    # 3) if we waited on the pid we care about, print the io stats and break out of the loop
+    # 4) otherwise sleep for a bit and check again
+    my $prociostats=getprociostats($pid);
+    my $r=waitpid(-1,WNOHANG);
+    if($r == $pid) {
+      $end_time=time();
+      logprint(sprintf('[%d] run time: %.6f seconds',$pid,($end_time-$start_time)));
+      if(defined $prociostats and length $prociostats > 0) {
+        logprint("[$pid] io stats: $prociostats");
+      }
+      logrusage($pid,$start_ru,getrusage_children,($end_time-$start_time));
+      logarcstats($pid,$start_arcstats,getarcstats(),($end_time-$start_time)) if defined $start_arcstats;
+      computeblockstats($pid,$start_blockstats,getallblockstats(),($end_time-$start_time));
+      logmemstats($pid,$start_memstats,getmemstats());
+      last;
+    }
+    elsif($r > 0) {
+      logprint("waitpid returned for another process: $r");
+      next; # try again right away
+    }
+    # I guess we should sleep a while
+    # it should be safe to sleep for a long time as the signal should
+    # interrupt the sleep and therefore we should only sleep as long
+    # as needed
+    sleep(300);
+  }
+  unless($? == 0) {
+    die "[$pid] failed: $?";
+  }
+  delete $SIG{CHLD};
+}
+
+sub b_mount {
+  my $fsopts=$_[0];
+  my $fs=$$fsopts{fs};
+  if(exists $matrix{$fs}{mount}) {
+    &{$matrix{$fs}{mount}};
+  } else {
+    sissy('mount','-o',$$fsopts{options},$DEVICE[0],$MOUNT);
+  }
+}
+
+sub b_umount {
+  my $fsopts=$_[0];
+  my $fs=$$fsopts{fs};
+  if(exists $matrix{$fs}{umount}) {
+    &{$matrix{$fs}{umount}};
+  } else {
+    sissy('umount',$MOUNT);
+  }
+}
+
+sub logprint {
+  print STDERR strftime("+++ benchrunner[${PID}]".'(%F %T): ',localtime(time())).$_[0]."\n";
+}
+
+sub memstats {
+  catter('/proc/meminfo');
+  $UNAME =~ /FreeBSD/ and sissy("sysctl vm.vmtotal");
+}
+
+sub arcstats {
+  catter('/proc/spl/kstat/zfs/arcstats');
+  $UNAME =~ /FreeBSD/ and eval {
+    sissy('sysctl','-q','kstat.zfs.misc.arcstats');
+  };
+}
+
+sub prefetch {
+  $UNAME =~ /FreeBSD/ and eval {
+    sissy("sysctl vfs.zfs.prefetch_disable");
+  };
+  catter('/sys/module/zfs/parameters/zfs_prefetch_disable');
+}
+
+sub catter {
+  foreach(@_) {
+    if($TEST) {
+      logprint("$_:");
+      next;
+    }
+    if(-f $_ and open(M,'<'.$_)) {
+      my @a=(<M>);
+      close(M);
+      @a > 0 or return;
+      logprint("$_:");
+      print STDERR @a;
+    }
+  }
+}
+
+sub runsummary {
+  my ($fsopts,$opts)=@_;
+  my @a;
+  push(@a,"device=".join(":",@DEVICE,@real_devices));
+  push(@a,"numruns=$NUMRUNS");
+  push(@a,'fs='.$$fsopts{fs});
+  push(@a,"bench=$BENCH");
+  push(@a,"trim=".($TRIM ? 'true' : 'false'));
+  if($$fsopts{fs} =~ /^zfs/) {
+    push(@a,"recordsize=".to_k(to_bytes($$fsopts{recordsize})).'k');
+    push(@a,"prefetch=".$$opts{prefetch});
+  }
+  elsif($$fsopts{fs} ne 'raw') {
+    push(@a,"fsblock=".$$fsopts{fsblock}) if defined $$fsopts{fsblock};
+    push(@a,'options="'.$$fsopts{options}.'"');
+  }
+  if($BENCH ne 'amarok') {
+    push(@a,'size='.$$opts{size});
+  }
+  if($BENCH =~ /^(fio|bonnie)/) {
+    push(@a,"threads=".$$opts{threads});
+  }
+  if($BENCH =~ /^fio/ or $BENCH eq 'bonnie++') {
+    push(@a,"block=".to_k(to_bytes($$opts{block})).'k');
+  }
+  if($BENCH eq 'amarok') {
+    push(@a,'source='.$SOURCE);
+  }
+  push(@a,'flush='.$$opts{flush});
+  if($BENCH =~ /^fio/) {
+    #push(@a,'fiofiles='.$FIOFILES);
+    #push(@a,"fiosize=".$FIOSIZE);
+    defined $$opts{$FIO_FADVISE_OPTION} and push(@a,$FIO_FADVISE_OPTION.'='.$$opts{fadvise});
+    defined $$opts{'ioengine'} and push(@a,"ioengine=".$$opts{ioengine});
+    defined $$opts{'iodepth'} and push(@a,"iodepth=".$$opts{iodepth});
+  }
+  return join(',',sort(@a));
+}
+
+sub multiplex {
+  my @l;
+  foreach my $k (keys(%{$_[0]})) {
+    next if @{$_[0]{$k}} == 0;
+    @l=what(\@l,$k,$_[0]{$k});
+  }
+  return @l;
+}
+
+sub what {
+  my @new;
+  foreach my $e (@{$_[2]}) {
+    if(@{$_[0]} > 0) {
+      foreach my $rr (@{$_[0]}) {
+        my $nr={%$rr};
+        $$nr{$_[1]}=$e;
+        push(@new,$nr);
+      }
+    }
+    else {
+      push(@new,{$_[1] => $e});
+    }
+  }
+  return @new;
+}
+
+sub defopt {
+  my ($opt,$val)=@_;
+  unless(defined $OPTIONS{$opt} and scalar @{$OPTIONS{$opt}} > 0) {
+    $OPTIONS{$opt}=[$val],
+  }
+}
+
+sub deffsopt {
+  my ($opt,$val)=@_;
+  unless(defined $FSOPTIONS{$opt} and scalar @{$FSOPTIONS{$opt}} > 0) {
+    $FSOPTIONS{$opt}=[$val],
+  }
+}
+
+sub getallblockstats {
+  my %stats;
+  foreach my $dev (@DEVICE,@BLOCKSTATS,@CACHE) {
+    $dev =~ /^\/dev\/(.+)$/ or next;
+    my $d=$1;
+    my $stat="/sys/block/$d/stat";
+    next unless -f $stat;
+    unless(open(S,$stat)) {
+      warn "unable to open $stat";
+      next;
+    }
+    $stats{$d}=[split(/\s+/,readline(S))];
+    close(S);
+  }
+  return \%stats;
+}
+
+sub computeblockstats {
+  my($pid,$pre,$post,$dur)=@_;
+  my %pos=(
+           'readiops'     => 1,
+           'readsectors'  => 3,
+           'readticks',   => 4,
+           'writeiops'    => 5,
+           'writesectors' => 7,
+           'writeticks',  => 8,
+          );
+  foreach my $dev (sort(keys(%{$pre}))) {
+    my @a;
+    push(@a,"dev:$dev");
+    foreach my $stat (sort(keys(%pos))) {
+      push(@a,sprintf("%s:%i,%s:%i",
+                      $stat,
+                      $$post{$dev}[$pos{$stat}]-$$pre{$dev}[$pos{$stat}],
+                      $stat.'/s',
+                      int(($$post{$dev}[$pos{$stat}]-$$pre{$dev}[$pos{$stat}])/$dur),
+                     ));
+    }
+    logprint("[$pid] blockstats: ".join(",",@a));
+  }
+}
+
+sub logrusage {
+  genstats(@_,'getrusage_children',[qw(ru_inblock ru_oublock)]);
+}
+
+sub logarcstats {
+  genstats(@_,'arcstats',[qw(
+                              hits
+                              misses
+                              demand_data_hits
+                              demand_data_misses
+                              demand_metadata_hits
+                              demand_metadata_misses
+                              prefetch_data_hits
+                              prefetch_data_misses
+                              prefetch_metadata_hits
+                              prefetch_metadata_misses
+                              mru_hits
+                              mru_ghost_hits
+                              mfu_hits
+                              mfu_ghost_hits
+                              l2_hits
+                              l2_misses
+                              l2_feeds
+                              l2_read_bytes
+                              l2_write_bytes
+                           )]
+          );
+}
+
+sub genstats {
+  my ($pid,$start,$end,$dur,$title,$keys)=@_;
+  my @a;
+  foreach my $key (@$keys) {
+    push(@a,
+         $key.':'.($$end{$key}-$$start{$key}),
+         $key.'/s:'.int(($$end{$key}-$$start{$key})/$dur)
+        );
+  }
+  logprint("[$pid] $title: ".join(',',@a));
+}
+
+sub logmemstats {
+  gengauge(@_,'memstats',[qw(
+                              MemTotal
+                              MemFree
+                              Buffers
+                              Cached
+                              SwapCached
+                              Active
+                              Inactive
+                              SwapTotal
+                              SwapFree
+                              Dirty
+                              Writeback
+                           )]
+          );
+}
+
+sub gengauge {
+  my ($pid,$start,$end,$title,$keys)=@_;
+  my @a;
+  foreach my $key (@$keys) {
+    push(@a,
+         $key.':'.$$end{$key},
+         $key.'/change:'.($$end{$key}-$$start{$key}).'kB',
+        );
+  }
+  logprint("[$pid] $title: ".join(',',@a));
+}
+
+sub getarcstats {
+  my $a={};
+  if($UNAME =~ /FreeBSD/) {
+    foreach(`sysctl -q kstat.zfs.misc.arcstats`) {
+      if(/kstat.zfs.misc.arcstats\.(.+?):\s*(\d+)/) {
+        $$a{$1}=$2;
+      }
+    }
+  }
+  else { # assume Linux
+    open(A,'</proc/spl/kstat/zfs/arcstats') or return undef;
+    my @s=(<A>);
+    close(A);
+    foreach my $x (@s) {
+      my @r=split(/\s+/,$x);
+      if(@r == 3 and $r[1] =~ /\d+/ and $r[2] =~ /\d+/) {
+        $$a{$r[0]}=$r[2];
+      }
+    }
+  }
+  return $a;
+}
+
+sub getmemstats {
+  my $a={};
+  my %table=('k' => 1,
+             'm' => 1024,
+             'g' => (1024*1024),
+             'p' => (1024*1024*1024),
+            );
+  if($UNAME =~ /FreeBSD/) {
+  }
+  else { # assume Linux
+    open(M,'</proc/meminfo') or return undef;
+    my @s=(<M>);
+    close(A);
+    foreach my $x (@s) {
+      if($x =~ /(.+):\s*(\d+)\s*(.)B/) {
+        exists $table{$3} or warn "multiplier not known: $3" and next;
+        $$a{$1}=($2*$table{$3});
+      }
+    }
+  }
+  return $a;
+}
+
+sub getprociostats {
+  # process id is in $_[0]
+  my $iofile="/proc/$_[0]/io";
+  my $a;
+  if(-f $iofile and open(I,'<'.$iofile)) {
+    my @a=(<I>);
+    close(I);
+    chomp @a;
+    $a=join(',',@a);
+    $a =~ s/ //g;
+  }
+  return $a;
+}
+
+sub to_bytes {
+  # I should probably be embarrassed by this function
+  if($_[0] =~ /^(\d+)([kmgt]?)(b|ib)?$/i) {
+    if($2 eq '') {
+      $1;
+    }
+    elsif($2 eq 'k' or $2 eq 'K') {
+      $1 * 1024;
+    }
+    elsif($2 eq 'm' or $2 eq 'M') {
+      $1 * 1024 * 1024;
+    }
+    elsif($2 eq 'g' or $2 eq 'G') {
+      $1 * 1024 * 1024 * 1024;
+    }
+    elsif($2 eq 't' or $2 eq 'T') {
+      $1 * 1024 * 1024 * 1024 * 1024;
+    }
+    else {
+      die "unable to parse $_";
+    }
+  }
+  else {
+    die "unable to parse integer byte value $_[0]";
+  }
+}
+
+sub to_k {
+  return int($_[0] / 1024);
+}
+
+sub to_m {
+  return int($_[0] / 1024 / 1024 );
+}
+
+sub optornot {
+  my ($opts,$param,$key)=@_;
+  defined $$opts{$key} and return "--${param}=".$$opts{$key};
+  return;
+}
+
+sub build_raid {
+  @real_devices=@DEVICE;
+  @DEVICE=($MD_DEVICE);
+  foreach my $d (@real_devices) {
+    eval {
+      sissy('wipefs','-a',$d);
+    };
+  }
+  my @com=('mdadm','--create',$MD_DEVICE,'-n',scalar @real_devices,'-l',$RAID_LEVEL,'-e','default','--chunk',$CHUNK,'--assume-clean');
+  if($Z_SIZE) {
+    push(@com,'--size',to_k(to_bytes($Z_SIZE)).'K');
+  }
+  push(@com,@real_devices);
+  sissy(@com);
+}
+
+sub destroy_raid {
+  sissy('mdadm','--stop',$MD_DEVICE);
+}
+
+sub mem_total_bytes {
+  open(M,'</proc/meminfo') or die "unable to open /proc/meminfo";
+  while(<M>) {
+    if(/MemTotal:\s+(\d+)\s+(\w+)/) {
+      return to_bytes("$1$2");
+    }
+  }
+  die "unable to find MemTotal";
+}
